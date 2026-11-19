@@ -271,8 +271,8 @@ static void servoSetPulse(uint32_t microseconds)
 #define LCD_YOFF     (3)
 #define LCD_TEST     (0) /* colour test at power up */
 #define IMU_TEST     (0) /* I2C bus scan at power up */
-#define FLUID_TEST   (0) /* FLIP water demo */
-#define GYRO_TEST    (1) /* IMU963RA gyro readout on the LCD */
+#define FLUID_TEST   (1) /* FLIP water demo, tilt controlled */
+#define GYRO_TEST    (0) /* IMU963RA gyro readout on the LCD */
 /* The LCD driver is needed by these, keep it compiled if any of them runs */
 #define LCD_ENABLED  (LCD_TEST || IMU_TEST || FLUID_TEST || GYRO_TEST)
 
@@ -757,7 +757,7 @@ static void imuTest(void)
 
 #endif /* IMU_TEST */
 
-#if GYRO_TEST
+#if (GYRO_TEST || FLUID_TEST)
 /* ------------------------------ IMU963RA gyro ----------------------------
  * FIXED 2026-11-19: the six-axis part of the IMU963RA is an ST LSM6DSR,
  * NOT an InvenSense/MPU6050 part. The old code used the MPU6050 map
@@ -978,10 +978,11 @@ static bool gyroReadData(int16_t *acc, int16_t *gyr)
  * result is subtracted from every later sample, which removes the fixed
  * zero-rate offset (that offset would otherwise integrate into tens of
  * degrees per minute). */
-static void gyroCalibrate(int32_t *bias)
+static void gyroCalibrate(int32_t *bias, int32_t *accRef)
 {
-    int32_t sum[3] = {0, 0, 0};
-    int32_t used   = 0;
+    int32_t sum[3]  = {0, 0, 0};
+    int32_t asum[3] = {0, 0, 0};
+    int32_t used    = 0;
 
     for (int32_t i = 0; i < 200; i++) {
         int16_t acc[3];
@@ -991,6 +992,9 @@ static void gyroCalibrate(int32_t *bias)
             sum[0] += gyr[0];
             sum[1] += gyr[1];
             sum[2] += gyr[2];
+            asum[0] += acc[0];
+            asum[1] += acc[1];
+            asum[2] += acc[2];
             used++;
         }
         delay_cycles(DELAY_MS(10));
@@ -1003,46 +1007,53 @@ static void gyroCalibrate(int32_t *bias)
         /* round to nearest instead of truncating */
         int32_t s = sum[i];
 
-        bias[i] = (s >= 0) ? (s + used / 2) / used : (s - used / 2) / used;
+        bias[i]   = (s >= 0) ? (s + used / 2) / used : (s - used / 2) / used;
+        accRef[i] = asum[i] / used;
     }
 }
 
-static void gyroRun(void)
+/* Gravity vector -> roll and pitch, in tenths of a degree */
+static void accelAngles(
+    int32_t axC, int32_t ayC, int32_t azC, int32_t *roll10, int32_t *pitch10)
 {
-    int16_t acc[3]   = {0, 0, 0};
-    int16_t gyr[3]   = {0, 0, 0};
-    int32_t accF[3]  = {0, 0, 0}; /* filtered accel, Q8.8 counts */
-    int32_t bias[3]  = {0, 0, 0};
-    int32_t yawU     = 0; /* half-millidegrees */
-    bool    accFInit = false;
-    uint8_t who      = 0;
-    bool    okWho    = false;
+    float ax    = (float) axC * 0.000244f;
+    float ay    = (float) ayC * 0.000244f;
+    float az    = (float) azC * 0.000244f;
+    float horiz = 0.0f;
+    float roll  = 0.0f;
+    float pitch = 0.0f;
 
-    lcdInit();
-    lcdRect(0, 0, LCD_W - 1, LCD_H - 1, LCD_BG);
+    (void) arm_sqrt_f32(ay * ay + az * az, &horiz);
+    (void) arm_atan2_f32(ay, az, &roll);
+    (void) arm_atan2_f32(-ax, horiz, &pitch);
+    *roll10  = (int32_t)(roll * 572.9578f);
+    *pitch10 = (int32_t)(pitch * 572.9578f);
+}
 
-    /* The bus scan found the LSM6DSR at 0x6B (SDO high). Probe 0x6B and 0x6A
-     * anyway so a module with SDO tied low works as well. */
-    {
-        const uint8_t cand[2] = {0x6B, 0x6A};
+/* Probes 0x6B and 0x6A, resets the LSM6DSR and writes its init sequence.
+ * Returns true and the WHO_AM_I value when the expected sensor answered. */
+static bool imuInit(uint8_t *whoOut)
+{
+    const uint8_t cand[2] = {0x6B, 0x6A};
+    uint8_t       who     = 0;
+    bool          ok      = false;
 
-        for (uint32_t a = 0; a < 2 && !okWho; a++) {
-            gyro_addr = cand[a];
-            (void) si2cWriteReg(0x01, 0x00);
-            (void) si2cWriteReg(0x12, 0x01); /* CTRL3_C: software reset */
-            delay_cycles(DELAY_MS(10));
-            for (uint32_t t = 0; t < 20 && !okWho; t++) {
-                if (si2cReadReg(GYRO_REG_WHO, &who, 1) &&
-                    who == GYRO_WHO_VALUE) {
-                    okWho = true;
-                } else {
-                    delay_cycles(DELAY_MS(10));
-                }
+    for (uint32_t a = 0; a < 2 && !ok; a++) {
+        gyro_addr = cand[a];
+        (void) si2cWriteReg(0x01, 0x00);
+        (void) si2cWriteReg(0x12, 0x01); /* CTRL3_C: software reset */
+        delay_cycles(DELAY_MS(10));
+        for (uint32_t t = 0; t < 20 && !ok; t++) {
+            if (si2cReadReg(GYRO_REG_WHO, &who, 1) &&
+                who == GYRO_WHO_VALUE) {
+                ok = true;
+            } else {
+                delay_cycles(DELAY_MS(10));
             }
         }
     }
 
-    if (okWho) {
+    if (ok) {
         /* LSM6DSR init (values from the SeekFree driver) */
         si2cWriteReg(0x0D, 0x03); /* INT1_CTRL */
         si2cWriteReg(0x10, 0x3C); /* CTRL1_XL: accel +-8 g, ODR on */
@@ -1053,8 +1064,32 @@ static void gyroRun(void)
         si2cWriteReg(0x15, 0x00); /* CTRL6_C */
         si2cWriteReg(0x16, 0x00); /* CTRL7_G */
         si2cWriteReg(0x18, 0x01); /* CTRL9_XL: I3C interface off */
-        delay_cycles(DELAY_MS(20));
+        delay_cycles(DELAY_MS(200)); /* settle before calibration */
     }
+
+    *whoOut = who;
+    return ok;
+}
+
+#if GYRO_TEST
+static void gyroRun(void)
+{
+    int16_t acc[3]    = {0, 0, 0};
+    int16_t gyr[3]    = {0, 0, 0};
+    int32_t accF[3]   = {0, 0, 0}; /* filtered accel, Q8.8 counts */
+    int32_t accRef[3] = {0, 0, 0}; /* gravity vector at power up */
+    int32_t bias[3]   = {0, 0, 0};
+    int32_t yawU      = 0; /* half-millidegrees */
+    int32_t roll0     = 0; /* reference attitude, tenths of a degree */
+    int32_t pitch0    = 0;
+    bool    accFInit  = false;
+    uint8_t who       = 0;
+    bool    okWho     = false;
+
+    lcdInit();
+    lcdRect(0, 0, LCD_W - 1, LCD_H - 1, LCD_BG);
+
+    okWho = imuInit(&who);
 
     lcdText(0, 0, "WHO", LCD_FG, LCD_BG);
     if (okWho) {
@@ -1064,28 +1099,29 @@ static void gyroRun(void)
     }
 
     if (okWho) {
-        delay_cycles(DELAY_MS(200)); /* let the gyro settle after ODR on */
-
-        lcdText(0, 64, "CAL", LCD_FG, LCD_BG); /* keep the board still */
-        gyroCalibrate(bias);
-        lcdText(0, 64, "   ", LCD_FG, LCD_BG);
+        lcdText(0, 112, "CAL", LCD_FG, LCD_BG); /* keep the board still */
+        gyroCalibrate(bias, accRef);
+        accelAngles(accRef[0], accRef[1], accRef[2], &roll0, &pitch0);
+        lcdText(0, 112, "   ", LCD_FG, LCD_BG);
     }
 
     while (1) {
         /* Pressing a button re-calibrates and zeroes the yaw */
         if (startStopPressed()) {
             yawU = 0;
-            lcdText(0, 64, "CAL", LCD_FG, LCD_BG);
-            gyroCalibrate(bias);
-            lcdText(0, 64, "   ", LCD_FG, LCD_BG);
+            lcdText(0, 112, "CAL", LCD_FG, LCD_BG);
+            gyroCalibrate(bias, accRef);
+            accelAngles(accRef[0], accRef[1], accRef[2], &roll0, &pitch0);
+            lcdText(0, 112, "   ", LCD_FG, LCD_BG);
         }
 
         bool ok = gyroReadData(acc, gyr);
 
         if (ok) {
-            int32_t gz = (int32_t) gyr[2] - bias[2];
+            int32_t gz      = (int32_t) gyr[2] - bias[2];
             int32_t mg[3];
-            float   axg, ayg, azg, horiz, roll, pitch;
+            int32_t roll10  = 0;
+            int32_t pitch10 = 0;
 
             /* Yaw integration at one sample per ~50 ms: one LSB is 70 mdps,
              * so one sample adds 70 * 0.05 = 3.5 mdeg = 7 half-mdeg. */
@@ -1109,31 +1145,43 @@ static void gyroRun(void)
             mg[1] = (int32_t)(accF[1] >> 8) * 244 / 1000;
             mg[2] = (int32_t)(accF[2] >> 8) * 244 / 1000;
 
-            /* Roll and pitch from the filtered gravity vector */
-            axg   = (float) accF[0] * (0.000244f / 256.0f);
-            ayg   = (float) accF[1] * (0.000244f / 256.0f);
-            azg   = (float) accF[2] * (0.000244f / 256.0f);
-            horiz = 0.0f;
-            roll  = 0.0f;
-            pitch = 0.0f;
-            (void) arm_sqrt_f32(ayg * ayg + azg * azg, &horiz);
-            (void) arm_atan2_f32(ayg, azg, &roll);
-            (void) arm_atan2_f32(-axg, horiz, &pitch);
-            roll *= 57.29578f;
-            pitch *= 57.29578f;
+            /* Attitude relative to the power-up orientation */
+            accelAngles(accF[0] >> 8, accF[1] >> 8, accF[2] >> 8, &roll10,
+                &pitch10);
+            roll10  -= roll0;
+            pitch10 -= pitch0;
 
-            lcdText(0, 16, "YAW", LCD_FG, LCD_BG);
-            lcdInt(32, 16, yawU / 2000, 6, LCD_FG, LCD_BG);
-            lcdText(0, 32, "AX", LCD_FG, LCD_BG);
-            lcdFixed(24, 32, mg[0], 3, 6, LCD_FG, LCD_BG);
-            lcdText(0, 48, "AY", LCD_FG, LCD_BG);
-            lcdFixed(24, 48, mg[1], 3, 6, LCD_FG, LCD_BG);
-            lcdText(0, 64, "AZ", LCD_FG, LCD_BG);
-            lcdFixed(24, 64, mg[2], 3, 6, LCD_FG, LCD_BG);
-            lcdText(0, 80, "ROL", LCD_FG, LCD_BG);
-            lcdFixed(32, 80, (int32_t)(roll * 10.0f), 1, 6, LCD_FG, LCD_BG);
-            lcdText(0, 96, "PIT", LCD_FG, LCD_BG);
-            lcdFixed(32, 96, (int32_t)(pitch * 10.0f), 1, 6, LCD_FG, LCD_BG);
+            /* Predicted 2-D gravity for the FLIP sim: same Q8.8 scale as
+             * F_GRAVITY (24). gx = G*sin(roll), gy = G*cos(roll), with the
+             * tilt clamped to +-45 degrees. */
+            int32_t tilt = roll10;
+            int32_t gsx;
+            int32_t gsy;
+
+            if (tilt > 450) {
+                tilt = 450;
+            } else if (tilt < -450) {
+                tilt = -450;
+            }
+            gsx = tilt * 419 / 10000;
+            gsy = 24 - (gsx * gsx) / 48;
+
+            lcdText(0, 0, "YAW", LCD_FG, LCD_BG);
+            lcdInt(32, 0, yawU / 2000, 6, LCD_FG, LCD_BG);
+            lcdText(0, 14, "AX", LCD_FG, LCD_BG);
+            lcdFixed(24, 14, mg[0], 3, 6, LCD_FG, LCD_BG);
+            lcdText(0, 28, "AY", LCD_FG, LCD_BG);
+            lcdFixed(24, 28, mg[1], 3, 6, LCD_FG, LCD_BG);
+            lcdText(0, 42, "AZ", LCD_FG, LCD_BG);
+            lcdFixed(24, 42, mg[2], 3, 6, LCD_FG, LCD_BG);
+            lcdText(0, 56, "ROL", LCD_FG, LCD_BG);
+            lcdFixed(32, 56, roll10, 1, 6, LCD_FG, LCD_BG);
+            lcdText(0, 70, "PIT", LCD_FG, LCD_BG);
+            lcdFixed(32, 70, pitch10, 1, 6, LCD_FG, LCD_BG);
+            lcdText(0, 84, "GSX", LCD_FG, LCD_BG);
+            lcdInt(32, 84, gsx, 6, LCD_FG, LCD_BG);
+            lcdText(0, 98, "GSY", LCD_FG, LCD_BG);
+            lcdInt(32, 98, gsy, 6, LCD_FG, LCD_BG);
         }
 
         lcdText(0, 112, ok ? "    " : "ERR", LCD_FG, LCD_BG);
@@ -1141,6 +1189,8 @@ static void gyroRun(void)
     }
 }
 #endif /* GYRO_TEST */
+
+#endif /* GYRO_TEST || FLUID_TEST */
 
 #if FLUID_TEST
 /* -------------------------------- FLIP water -----------------------------
@@ -1175,6 +1225,8 @@ static int16_t fox[F_NP], foy[F_NP]; /* grid velocity sampled before P2G */
 static uint8_t fcount[F_N][F_N];
 static uint8_t fshown[F_N][F_N];
 static int32_t fTopJ; /* first row that holds particles, minus a margin */
+static int16_t fGx;   /* gravity across the screen, set from the IMU roll */
+static int16_t fGy = F_GRAVITY; /* gravity down the screen */
 
 static int32_t fclamp(int32_t v, int32_t lo, int32_t hi)
 {
@@ -1184,6 +1236,18 @@ static int32_t fclamp(int32_t v, int32_t lo, int32_t hi)
 static int32_t fmin32(int32_t a, int32_t b)
 {
     return (a < b) ? a : b;
+}
+
+/* Round-to-nearest, symmetric shift. A plain >> floors, so every negative
+ * product loses up to one LSB. Applied per particle per frame that tiny bias
+ * behaves like a constant acceleration: over a few hundred frames the water
+ * slowly slides to the left wall (and a tilt in that direction blows up). */
+static int32_t frshr(int32_t v, int32_t s)
+{
+    if (v >= 0) {
+        return (v + (1 << (s - 1))) >> s;
+    }
+    return -((-v + (1 << (s - 1))) >> s);
 }
 
 /* Bilinear sample of the u faces (u sits at x = i, y = j + 0.5) */
@@ -1198,10 +1262,10 @@ static int32_t fsampleU(int32_t x, int32_t y)
     int32_t b  = fu[i + 1][j];
     int32_t c  = fu[i][j1];
     int32_t d  = fu[i + 1][j1];
-    int32_t top = a + (((b - a) * fx) >> 8);
-    int32_t bot = c + (((d - c) * fx) >> 8);
+    int32_t top = a + frshr((b - a) * fx, 8);
+    int32_t bot = c + frshr((d - c) * fx, 8);
 
-    return top + (((bot - top) * fy) >> 8);
+    return top + frshr((bot - top) * fy, 8);
 }
 
 /* Bilinear sample of the v faces (v sits at x = i + 0.5, y = j) */
@@ -1216,10 +1280,10 @@ static int32_t fsampleV(int32_t x, int32_t y)
     int32_t b  = fv[i][j + 1];
     int32_t c  = fv[i1][j];
     int32_t d  = fv[i1][j + 1];
-    int32_t top = a + (((c - a) * fx) >> 8);
-    int32_t bot = b + (((d - b) * fx) >> 8);
+    int32_t top = a + frshr((c - a) * fx, 8);
+    int32_t bot = b + frshr((d - b) * fx, 8);
 
-    return top + (((bot - top) * fy) >> 8);
+    return top + frshr((bot - top) * fy, 8);
 }
 
 static void fclearGrids(void)
@@ -1260,13 +1324,13 @@ static void fp2g(void)
         w11 = (fx * fy) >> 8;
 
         fu[i][j] = (int16_t) fclamp(
-            fu[i][j] + ((vx * w00) >> 8), -30000, 30000);
+            fu[i][j] + frshr(vx * w00, 8), -30000, 30000);
         fu[i + 1][j] = (int16_t) fclamp(
-            fu[i + 1][j] + ((vx * w10) >> 8), -30000, 30000);
+            fu[i + 1][j] + frshr(vx * w10, 8), -30000, 30000);
         fu[i][j1] = (int16_t) fclamp(
-            fu[i][j1] + ((vx * w01) >> 8), -30000, 30000);
+            fu[i][j1] + frshr(vx * w01, 8), -30000, 30000);
         fu[i + 1][j1] = (int16_t) fclamp(
-            fu[i + 1][j1] + ((vx * w11) >> 8), -30000, 30000);
+            fu[i + 1][j1] + frshr(vx * w11, 8), -30000, 30000);
 
         fuw[i][j]     = (int16_t) fclamp(fuw[i][j] + w00, 0, 30000);
         fuw[i + 1][j] = (int16_t) fclamp(fuw[i + 1][j] + w10, 0, 30000);
@@ -1285,13 +1349,13 @@ static void fp2g(void)
         w11 = (fx * fy) >> 8;
 
         fv[i][j] = (int16_t) fclamp(
-            fv[i][j] + ((vy * w00) >> 8), -30000, 30000);
+            fv[i][j] + frshr(vy * w00, 8), -30000, 30000);
         fv[i1][j] = (int16_t) fclamp(
-            fv[i1][j] + ((vy * w10) >> 8), -30000, 30000);
+            fv[i1][j] + frshr(vy * w10, 8), -30000, 30000);
         fv[i][j + 1] = (int16_t) fclamp(
-            fv[i][j + 1] + ((vy * w01) >> 8), -30000, 30000);
+            fv[i][j + 1] + frshr(vy * w01, 8), -30000, 30000);
         fv[i1][j + 1] = (int16_t) fclamp(
-            fv[i1][j + 1] + ((vy * w11) >> 8), -30000, 30000);
+            fv[i1][j + 1] + frshr(vy * w11, 8), -30000, 30000);
 
         fvw[i][j]         = (int16_t) fclamp(fvw[i][j] + w00, 0, 30000);
         fvw[i1][j]        = (int16_t) fclamp(fvw[i1][j] + w10, 0, 30000);
@@ -1367,8 +1431,8 @@ static void fpressure(void)
                 int32_t pR = (i < F_N - 1) ? fp[i + 1][j] : fp[i][j];
                 int32_t pU = (j > fTopJ) ? fp[i][j - 1] : fp[i][j];
                 int32_t pD = (j < F_N - 1) ? fp[i][j + 1] : fp[i][j];
-                int32_t gs = (pL + pR + pU + pD - fd[i][j]) >> 2;
-                int32_t v  = fp[i][j] + (((gs - fp[i][j]) * F_OMEGA) >> 8);
+                int32_t gs = frshr(pL + pR + pU + pD - fd[i][j], 2);
+                int32_t v  = fp[i][j] + frshr((gs - fp[i][j]) * F_OMEGA, 8);
 
                 fp[i][j] = (int16_t) fclamp(v, -16000, 16000);
             }
@@ -1419,11 +1483,22 @@ static void fluidStep(void)
     /* Gravity goes on the grid, not on the particles: only then can the
      * projection cancel it for resting fluid (hydrostatic pressure).
      * Adding it to the particles and keeping it in the FLIP term makes the
-     * whole pool sink into the floor. */
+     * whole pool sink into the floor.
+     * fGy / fGx come from the IMU roll, so tilting the board tilts gravity
+     * and the water runs "downhill". Walls are faces 0 and F_N, which are
+     * never touched here (and were zeroed by fnormalise). */
     for (int32_t i = 0; i < F_N; i++) {
         for (int32_t j = fTopJ + 1; j < F_N; j++) {
             fv[i][j] = (int16_t) fclamp(
-                fv[i][j] + F_GRAVITY, -F_VMAX, F_VMAX);
+                fv[i][j] + fGy, -F_VMAX, F_VMAX);
+        }
+    }
+    if (fGx != 0) {
+        for (int32_t i = 1; i < F_N; i++) {
+            for (int32_t j = fTopJ; j < F_N; j++) {
+                fu[i][j] = (int16_t) fclamp(
+                    fu[i][j] + fGx, -F_VMAX, F_VMAX);
+            }
         }
     }
 
@@ -1435,9 +1510,9 @@ static void fluidStep(void)
         int32_t vgx = fsampleU(fpx[p], fpy[p]);
         int32_t vgy = fsampleV(fpx[p], fpy[p]);
         int32_t nvx =
-            vgx + (((int32_t)(fvx[p] - fox[p]) * F_FLIP_KEEP) >> 8);
+            vgx + frshr((int32_t)(fvx[p] - fox[p]) * F_FLIP_KEEP, 8);
         int32_t nvy =
-            vgy + (((int32_t)(fvy[p] - foy[p]) * F_FLIP_KEEP) >> 8);
+            vgy + frshr((int32_t)(fvy[p] - foy[p]) * F_FLIP_KEEP, 8);
         int32_t nx, ny;
 
         nvx = fclamp(nvx, -F_VMAX, F_VMAX);
@@ -1533,13 +1608,69 @@ static void fluidRender(void)
 /* Entry point of the demo: never returns */
 static void fluidRun(void)
 {
-    int32_t stir = 1;
+    int32_t stir      = 1;
+    int16_t acc[3]    = {0, 0, 0};
+    int16_t gyr[3]    = {0, 0, 0};
+    int32_t accF[3]   = {0, 0, 0}; /* filtered accel, Q8.8 counts */
+    int32_t bias[3]   = {0, 0, 0};
+    int32_t accRef[3] = {0, 0, 0}; /* gravity vector at power up */
+    int32_t roll0     = 0; /* attitude when the demo started = "level" */
+    int32_t pitch0    = 0;
+    bool    accFInit  = false;
+    uint8_t who       = 0;
 
     lcdInit();
     lcdRect(0, 0, LCD_W - 1, LCD_H - 1, F_BG);
     fluidInit();
 
+    /* The IMU drives the gravity vector. Hold the board still once after
+     * power-up in the position that should mean "level": that attitude is
+     * stored as the zero point. Without the IMU the water simply falls
+     * straight down, as before. */
+    if (imuInit(&who)) {
+        lcdText(0, 0, "CAL", LCD_FG, LCD_BG);
+        gyroCalibrate(bias, accRef);
+        accelAngles(accRef[0], accRef[1], accRef[2], &roll0, &pitch0);
+        lcdRect(0, 0, 31, 7, F_BG); /* erase "CAL" */
+    } else {
+        lcdText(0, 0, "NO IMU", LCD_RGB565(255, 0, 0), F_BG);
+    }
+
     while (1) {
+        /* Roll -> horizontal gravity, once per frame (the I2C read is a few
+         * ms). The water must run towards the side that is LOWER; the test on
+         * the board showed right side down -> ROLL negative, so flip the sign:
+         *   gx = -(G * sin(roll)), gy = G * cos(roll)
+         * with 419/10000 ~ 24*pi/1800 for small angles and a +-45 deg clamp. */
+        if (gyroReadData(acc, gyr)) {
+            int32_t roll10  = 0;
+            int32_t pitch10 = 0;
+            int32_t rel;
+
+            if (!accFInit) {
+                accF[0]  = (int32_t) acc[0] << 8;
+                accF[1]  = (int32_t) acc[1] << 8;
+                accF[2]  = (int32_t) acc[2] << 8;
+                accFInit = true;
+            } else {
+                for (int32_t i = 0; i < 3; i++) {
+                    accF[i] += (((int32_t) acc[i] << 8) - accF[i]) >> 3;
+                }
+            }
+
+            accelAngles(
+                accF[0] >> 8, accF[1] >> 8, accF[2] >> 8, &roll10, &pitch10);
+
+            rel = roll10 - roll0;
+            if (rel > -4 && rel < 4) {
+                rel = 0; /* deadband: sensor noise must not push the water */
+            }
+            rel = fclamp(rel, -450, 450);
+
+            fGx = (int16_t)(-(rel * 419 / 10000));
+            fGy = (int16_t)(F_GRAVITY - ((int32_t) fGx * fGx) / 48);
+        }
+
         if (startStopPressed()) {
             /* stir the water sideways, alternating direction on every press */
             for (int32_t p = 0; p < F_NP; p++) {

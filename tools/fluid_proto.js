@@ -9,6 +9,7 @@ const N = 32, GRAVITY = 24, VMAX = 1024;
 const NP = parseInt(process.env.NP || '300', 10);
 
 const FLIP_KEEP = parseInt(process.env.FLIP || '230', 10); /* Q8.8 */
+const GX = parseInt(process.env.GX || '0', 10); /* sideways gravity, like tilt */
 const ITERS = parseInt(process.env.ITERS || '40', 10);
 const WARM = process.env.WARM !== '0';
 const OMEGA = parseInt(process.env.OMEGA || '256', 10); /* Q8.8, 256 = plain GS */
@@ -16,6 +17,11 @@ const WATER = [0, 120, 255], BG = [0, 0, 0];
 
 const clamp = (v, lo, hi) => (v < lo ? lo : (v > hi ? hi : v));
 const min32 = (a, b) => (a < b ? a : b);
+/* round-to-nearest, symmetric shift. Plain >> floors, which biases every
+ * negative product downwards; applied per particle per frame that tiny bias
+ * acts as a constant acceleration and the water slowly slides left. */
+const rshr = (v, s) =>
+    (v >= 0) ? ((v + (1 << (s - 1))) >> s) : -(((-v) + (1 << (s - 1))) >> s);
 
 const fu = [], fv = [], fuw = [], fvw = [], fp = [], fd = [];
 for (let i = 0; i <= N; i++) { fu.push(new Int32Array(N)); fuw.push(new Int32Array(N)); }
@@ -24,6 +30,18 @@ for (let i = 0; i < N; i++) { fp.push(new Int32Array(N)); fd.push(new Int32Array
 const px = new Int32Array(NP), py = new Int32Array(NP);
 const vx = new Int32Array(NP), vy = new Int32Array(NP);
 const ox = new Int32Array(NP), oy = new Int32Array(NP);
+const mask = new Uint8Array(N * N); /* 1 = cell holds at least one particle */
+const MASKED = process.env.MASK !== '0';
+
+const GRAV_MASKED = process.env.GMASK !== '0';
+
+function isFluid(i, j) {
+    return MASKED ? mask[i * N + j] !== 0 : true;
+}
+
+function hasParticle(i, j) {
+    return GRAV_MASKED ? mask[i * N + j] !== 0 : true;
+}
 
 function sampleU(x, y) {
     let i = clamp(x >> 8, 0, N - 1);
@@ -31,9 +49,9 @@ function sampleU(x, y) {
     const j1 = min32(j + 1, N - 1);
     const fx = x & 0xFF, fy = (y - 128) & 0xFF;
     const a = fu[i][j], b = fu[i + 1][j], c = fu[i][j1], d = fu[i + 1][j1];
-    const top = a + (((b - a) * fx) >> 8);
-    const bot = c + (((d - c) * fx) >> 8);
-    return top + (((bot - top) * fy) >> 8);
+    const top = a + rshr((b - a) * fx, 8);
+    const bot = c + rshr((d - c) * fx, 8);
+    return top + rshr((bot - top) * fy, 8);
 }
 
 function sampleV(x, y) {
@@ -42,9 +60,9 @@ function sampleV(x, y) {
     let j = clamp(y >> 8, 0, N - 1);
     const fx = (x - 128) & 0xFF, fy = y & 0xFF;
     const a = fv[i][j], b = fv[i][j + 1], c = fv[i1][j], d = fv[i1][j + 1];
-    const top = a + (((c - a) * fx) >> 8);
-    const bot = b + (((d - b) * fx) >> 8);
-    return top + (((bot - top) * fy) >> 8);
+    const top = a + rshr((c - a) * fx, 8);
+    const bot = b + rshr((d - b) * fx, 8);
+    return top + rshr((bot - top) * fy, 8);
 }
 
 function clearGrids() {
@@ -65,10 +83,10 @@ function p2g() {
         let w01 = ((256 - fx) * fy) >> 8;
         let w11 = (fx * fy) >> 8;
 
-        fu[i][j] = clamp(fu[i][j] + ((vxp * w00) >> 8), -30000, 30000);
-        fu[i + 1][j] = clamp(fu[i + 1][j] + ((vxp * w10) >> 8), -30000, 30000);
-        fu[i][j1] = clamp(fu[i][j1] + ((vxp * w01) >> 8), -30000, 30000);
-        fu[i + 1][j1] = clamp(fu[i + 1][j1] + ((vxp * w11) >> 8), -30000, 30000);
+        fu[i][j] = clamp(fu[i][j] + rshr(vxp * w00, 8), -30000, 30000);
+        fu[i + 1][j] = clamp(fu[i + 1][j] + rshr(vxp * w10, 8), -30000, 30000);
+        fu[i][j1] = clamp(fu[i][j1] + rshr(vxp * w01, 8), -30000, 30000);
+        fu[i + 1][j1] = clamp(fu[i + 1][j1] + rshr(vxp * w11, 8), -30000, 30000);
 
         fuw[i][j] = clamp(fuw[i][j] + w00, 0, 30000);
         fuw[i + 1][j] = clamp(fuw[i + 1][j] + w10, 0, 30000);
@@ -84,10 +102,10 @@ function p2g() {
         w01 = ((256 - fx) * fy) >> 8;
         w11 = (fx * fy) >> 8;
 
-        fv[i][j] = clamp(fv[i][j] + ((vyp * w00) >> 8), -30000, 30000);
-        fv[i1][j] = clamp(fv[i1][j] + ((vyp * w10) >> 8), -30000, 30000);
-        fv[i][j + 1] = clamp(fv[i][j + 1] + ((vyp * w01) >> 8), -30000, 30000);
-        fv[i1][j + 1] = clamp(fv[i1][j + 1] + ((vyp * w11) >> 8), -30000, 30000);
+        fv[i][j] = clamp(fv[i][j] + rshr(vyp * w00, 8), -30000, 30000);
+        fv[i1][j] = clamp(fv[i1][j] + rshr(vyp * w10, 8), -30000, 30000);
+        fv[i][j + 1] = clamp(fv[i][j + 1] + rshr(vyp * w01, 8), -30000, 30000);
+        fv[i1][j + 1] = clamp(fv[i1][j + 1] + rshr(vyp * w11, 8), -30000, 30000);
 
         fvw[i][j] = clamp(fvw[i][j] + w00, 0, 30000);
         fvw[i1][j] = clamp(fvw[i1][j] + w10, 0, 30000);
@@ -117,8 +135,31 @@ function step() {
     /* band optimisation: only the rows that hold particles (plus a margin)
      * take part in gravity, divergence and the pressure solve */
     let minRow = N - 1;
-    for (let p = 0; p < NP; p++) minRow = Math.min(minRow, py[p] >> 8);
+    mask.fill(0);
+    for (let p = 0; p < NP; p++) {
+        minRow = Math.min(minRow, py[p] >> 8);
+        mask[clamp(px[p] >> 8, 0, N - 1) * N + clamp(py[p] >> 8, 0, N - 1)] = 1;
+    }
     const topJ = clamp(minRow - 2, 0, N - 1);
+    /* dilate the mask by one cell: the surface moves, and a cell that is air
+     * now can hold particles next frame - if it flickers between fluid and
+     * air the pressure solve injects energy */
+    if (MASKED && process.env.DILATE !== '0') {
+        const m2 = Uint8Array.from(mask);
+        for (let i = 0; i < N; i++) {
+            for (let j = 0; j < N; j++) {
+                if (!mask[i * N + j]) continue;
+                for (let dj = -1; dj <= 1; dj++) {
+                    for (let di = -1; di <= 1; di++) {
+                        const ii = i + di, jj = j + dj;
+                        if (ii >= 0 && ii < N && jj >= 0 && jj < N)
+                            m2[ii * N + jj] = 1;
+                    }
+                }
+            }
+        }
+        mask.set(m2);
+    }
 
     for (let p = 0; p < NP; p++) {
         ox[p] = sampleU(px[p], py[p]);
@@ -132,7 +173,13 @@ function step() {
      * cancel it for resting fluid (hydrostatic pressure) */
     for (let i = 0; i < N; i++)
         for (let j = topJ + 1; j < N; j++)
-            fv[i][j] = clamp(fv[i][j] + GRAVITY, -VMAX, VMAX);
+            if (hasParticle(i, j) || hasParticle(i, j - 1))
+                fv[i][j] = clamp(fv[i][j] + GRAVITY, -VMAX, VMAX);
+    if (GX !== 0)
+        for (let i = 1; i < N; i++)
+            for (let j = topJ; j < N; j++)
+                if (hasParticle(i, j) || hasParticle(i - 1, j))
+                    fu[i][j] = clamp(fu[i][j] + GX, -VMAX, VMAX);
 
     for (let i = 0; i < N; i++)
         for (let j = topJ; j < N; j++)
@@ -142,12 +189,13 @@ function step() {
     for (let k = 0; k < ITERS; k++) {
         for (let i = 0; i < N; i++) {
             for (let j = topJ; j < N; j++) {
+                if (!isFluid(i, j)) { fp[i][j] = 0; continue; } /* air */
                 const pL = i > 0 ? fp[i - 1][j] : fp[i][j];
                 const pR = i < N - 1 ? fp[i + 1][j] : fp[i][j];
                 const pU = j > topJ ? fp[i][j - 1] : fp[i][j];
                 const pD = j < N - 1 ? fp[i][j + 1] : fp[i][j];
-                const gs = (pL + pR + pU + pD - fd[i][j]) >> 2;
-                const np = fp[i][j] + (((gs - fp[i][j]) * OMEGA) >> 8);
+                const gs = rshr(pL + pR + pU + pD - fd[i][j], 2);
+                const np = fp[i][j] + rshr((gs - fp[i][j]) * OMEGA, 8);
                 fp[i][j] = clamp(np, -16000, 16000);
             }
         }
@@ -162,8 +210,8 @@ function step() {
     for (let p = 0; p < NP; p++) {
         const vgx = sampleU(px[p], py[p]);
         const vgy = sampleV(px[p], py[p]);
-        let nvx = clamp(vgx + (((vx[p] - ox[p]) * FLIP_KEEP) >> 8), -VMAX, VMAX);
-        let nvy = clamp(vgy + (((vy[p] - oy[p]) * FLIP_KEEP) >> 8), -VMAX, VMAX);
+        let nvx = clamp(vgx + rshr((vx[p] - ox[p]) * FLIP_KEEP, 8), -VMAX, VMAX);
+        let nvy = clamp(vgy + rshr((vy[p] - oy[p]) * FLIP_KEEP, 8), -VMAX, VMAX);
         let nx = px[p] + nvx, ny = py[p] + nvy;
         if (nx < 128) { nx = 128; nvx = 0; }
         if (nx > N * 256 - 128) { nx = N * 256 - 128; nvx = 0; }
@@ -246,9 +294,11 @@ function renderPNG(path, scale) {
 
 init();
 let stepCount = 0;
-const frames = [0, 1, 5, 15, 30, 60, 120];
+const frames = (process.env.FRAME_LIST || '0,1,5,15,30,60,120')
+    .split(',').map(Number);
+const totalFrames = parseInt(process.env.FRAMES || '120', 10);
 let maxAbsFu = 0, maxAbsFv = 0, maxAbsP = 0;
-for (let f = 0; f <= 120; f++) {
+for (let f = 0; f <= totalFrames; f++) {
     if (frames.includes(f)) {
         const total = renderPNG(`frame_${String(f).padStart(3, '0')}.png`, 4);
         console.log(`frame ${f}: cells with water = ${total}`);
