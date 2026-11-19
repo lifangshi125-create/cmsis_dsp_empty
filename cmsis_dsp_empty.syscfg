@@ -1,0 +1,135 @@
+/**
+ * These arguments were used when this file was generated. They will be automatically applied on subsequent loads
+ * via the GUI or CLI. Run CLI with '--help' for additional information on how to override these arguments.
+ */
+//@cliArgs --device "MSPM0G350X" --package "LQFP-64(PM)" --part "Default"
+//@v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)"
+// @cliArgs --board /ti/boards/LP_MSPM0G3507 --rtos nortos
+
+/**
+ * Import the modules used in this configuration.
+ */
+const ProjectConfig = scripting.addModule("/ti/project_config/ProjectConfig");
+const SYSCTL = scripting.addModule("/ti/driverlib/SYSCTL");
+const GPIO   = scripting.addModule("/ti/driverlib/GPIO", {}, false);
+const GPIO1  = GPIO.addInstance();
+const GPIO2  = GPIO.addInstance();
+const SPI    = scripting.addModule("/ti/driverlib/SPI", {}, false);
+const SPI1   = SPI.addInstance();
+const I2C    = scripting.addModule("/ti/driverlib/I2C", {}, false);
+const I2C1   = I2C.addInstance();
+const UART   = scripting.addModule("/ti/driverlib/UART", {}, false);
+const UART1  = UART.addInstance();
+const UART2  = UART.addInstance();
+const PWM    = scripting.addModule("/ti/driverlib/PWM", {}, false);
+const PWM1   = PWM.addInstance();
+
+/**
+ * Write custom configuration values to the imported modules.
+ */
+ProjectConfig.genLibCMSIS = true;
+
+/* Start/stop switches, all wired pin-to-GND so they read low when pressed
+ * (internal pull-ups enabled). PB25/PB22 are for external buttons, PB21 is
+ * the S2 button already on the LaunchPad. */
+GPIO1.$name                              = "GPIO_BUTTONS";
+GPIO1.port                               = "PORTB";
+GPIO1.associatedPins.create(3);
+GPIO1.associatedPins[0].$name            = "USER_BTN_1";
+GPIO1.associatedPins[0].direction        = "INPUT";
+GPIO1.associatedPins[0].internalResistor = "PULL_UP";
+GPIO1.associatedPins[0].assignedPin      = "25";
+GPIO1.associatedPins[1].$name            = "USER_BTN_2";
+GPIO1.associatedPins[1].direction        = "INPUT";
+GPIO1.associatedPins[1].internalResistor = "PULL_UP";
+GPIO1.associatedPins[1].assignedPin      = "22";
+GPIO1.associatedPins[2].$name            = "USER_BTN_3";
+GPIO1.associatedPins[2].direction        = "INPUT";
+GPIO1.associatedPins[2].internalResistor = "PULL_UP";
+GPIO1.associatedPins[2].assignedPin      = "21";
+
+/* Link to the stepper driver board (ZDT / Emm42 closed loop), on the pins the
+ * board labels A0/A1.
+ *   PA0 (UART0_TX) -> driver RX
+ *   PA1 (UART0_RX) <- driver TX
+ * PA0/PA1 are OPEN-DRAIN pads: they can pull the line low, never high, so the
+ * idle level has to come from a pull-up somewhere. If the driver's own RX
+ * input provides one nothing else is needed - verify by measuring PA0 against
+ * GND while idle, it must sit near 3.3V. Otherwise solder a 10k resistor from
+ * PA0 to 3.3V, or the driver will never receive a valid frame. */
+UART1.$name                    = "UART_DRIVER";
+UART1.enableFIFO               = true;
+UART1.enableDMARX              = false;
+UART1.enableDMATX              = false;
+UART1.targetBaudRate           = 115200;
+UART1.enableInternalLoopback   = false;
+UART1.peripheral.$assign       = "UART0";
+UART1.peripheral.rxPin.$assign = "PA1";
+UART1.peripheral.txPin.$assign = "PA0";
+
+/* Debug console on UART1 (PA8/PA9). Optional: delete this instance if those
+ * pins are not broken out on the board. With a USB-TTL adapter on PA8 (TX) /
+ * PA9 (RX) at 115200 8N1 the trace below becomes visible. */
+UART2.$name                    = "UART_DEBUG";
+UART2.enableFIFO               = true;
+UART2.enableDMARX              = false;
+UART2.enableDMATX              = false;
+UART2.targetBaudRate           = 115200;
+UART2.enableInternalLoopback   = false;
+UART2.peripheral.$assign       = "UART1";
+UART2.peripheral.rxPin.$assign = "PA9";
+UART2.peripheral.txPin.$assign = "PA8";
+
+/* Servo signal on PA27 (TIMG8 CCP1): 50 Hz hobby servo PWM.
+ * 32 MHz / 16 = 2 MHz counter -> 40000 ticks is a 20 ms period and one tick
+ * is 0.5 us, so 1.5 ms (centre) is 3000 ticks. */
+PWM1.$name                      = "PWM_SERVO";
+PWM1.clockPrescale              = 16;
+PWM1.timerCount                 = 40000;
+PWM1.ccIndex                    = [1];
+PWM1.peripheral.$assign         = "TIMG8";
+PWM1.peripheral.ccp1Pin.$assign = "PA27";
+PWM1.PWM_CHANNEL_1.$name        = "ti_driverlib_pwm_PWMTimerCC1";
+PWM1.PWM_CHANNEL_1.dutyCycle    = 7.5;
+
+/* 1.44" ST7735 TFT (128x128). SPI1 is write-only here: SCLK on PB9 and
+ * PICO (MOSI) on PB8 come from the hardware SPI, CS/DC/RES/BLK are plain
+ * GPIOs. CS is driven low once in software, the bus has a single device. */
+SPI1.$name                      = "SPI_LCD";
+SPI1.frameFormat                = "MOTO3";  /* no hardware CS pin needed */
+SPI1.direction                  = "PICO";   /* output only - the TFT is write-only */
+SPI1.targetBitRate              = 8000000;
+SPI1.peripheral.$assign         = "SPI1";
+SPI1.peripheral.sclkPin.$assign = "PB9";
+SPI1.peripheral.mosiPin.$assign = "PB8";
+
+GPIO2.$name                         = "GPIO_TFT";
+GPIO2.port                          = "PORTB";
+GPIO2.associatedPins.create(4);
+GPIO2.associatedPins[0].$name       = "RES";
+GPIO2.associatedPins[0].direction   = "OUTPUT";
+GPIO2.associatedPins[0].initialValue = "SET";
+GPIO2.associatedPins[0].assignedPin = "10";
+GPIO2.associatedPins[1].$name       = "DC";
+GPIO2.associatedPins[1].direction   = "OUTPUT";
+GPIO2.associatedPins[1].assignedPin = "11";
+GPIO2.associatedPins[2].$name       = "CS";
+GPIO2.associatedPins[2].direction   = "OUTPUT";
+GPIO2.associatedPins[2].initialValue = "SET";
+GPIO2.associatedPins[2].assignedPin = "0";
+GPIO2.associatedPins[3].$name       = "BLK";
+GPIO2.associatedPins[3].direction   = "OUTPUT";
+GPIO2.associatedPins[3].assignedPin = "26";
+
+/* IMU963RA on I2C1: SDA = PA16, SCL = PA17, 100 kHz (SysConfig default).
+ * The module carries its own pull-ups; if the bus scan finds nothing, add
+ * 4.7k pull-ups to 3.3V and/or check the wiring. */
+I2C1.$name                     = "I2C_IMU";
+I2C1.basicEnableController     = true;
+I2C1.peripheral.$assign        = "I2C1";
+I2C1.peripheral.sdaPin.$assign = "PA16";
+I2C1.peripheral.sclPin.$assign = "PA17";
+
+const Board = scripting.addModule("/ti/driverlib/Board", {}, false);
+
+SYSCTL.clockTreeEn = true;
