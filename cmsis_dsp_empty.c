@@ -679,14 +679,23 @@ static void imuTest(void)
 
 #if GYRO_TEST
 /* ------------------------------ IMU963RA gyro ----------------------------
- * The six-axis part sits at 0x68 and follows the classic InvenSense register
- * map: 0x75 WHO_AM_I, 0x6B PWR_MGMT_1, 0x1B GYRO_CONFIG, 0x1C ACCEL_CONFIG,
- * 0x3B..0x48 accel / temperature / gyro. The raw gyro values are printed so
- * the zero-rate drift can be watched.
+ * FIXED 2026-11-19: the six-axis part of the IMU963RA is an ST LSM6DSR,
+ * NOT an InvenSense/MPU6050 part. The old code used the MPU6050 map
+ * (address 0x68, WHO 0x75, data 0x3B, big-endian), so the sensor never
+ * ACKed, every read failed and GX/GY/GZ were never drawn.
+ * LSM6DSR map used below:
+ *   address 0x6B (SDO high) or 0x6A (SDO low) - probed at start-up
+ *   WHO_AM_I register 0x0F, expected value 0x6B
+ *   gyro data from 0x22, accel data from 0x28, LOW byte first
+ *   CTRL1_XL 0x10 / CTRL2_G 0x11 / CTRL3_C 0x12 must be written to start
+ *   the sensors (power-on default is ODR = 0, i.e. powered down).
+ * Init values match the SeekFree zf_device_imu963ra driver.
  */
-#define GYRO_ADDR     (0x68)
-#define GYRO_REG_WHO  (0x75)
-#define GYRO_DATA     (0x3B)
+#define GYRO_REG_WHO    (0x0F) /* WHO_AM_I */
+#define GYRO_WHO_VALUE  (0x6B)
+#define GYRO_DATA_G     (0x22) /* OUTX_L_G, 12 bytes: gyro then accel */
+
+static uint8_t gyro_addr = 0x6B; /* probed address, 0x6B or 0x6A */
 #define LCD_FG        LCD_RGB565(255, 255, 255)
 #define LCD_BG        LCD_RGB565(0, 0, 0)
 
@@ -827,7 +836,7 @@ static bool si2cWriteReg(uint8_t reg, uint8_t val)
     bool ok;
 
     si2cStart();
-    ok  = si2cWriteByte((uint8_t)(GYRO_ADDR << 1));
+    ok  = si2cWriteByte((uint8_t)(gyro_addr << 1));
     ok &= si2cWriteByte(reg);
     ok &= si2cWriteByte(val);
     si2cStop();
@@ -840,13 +849,13 @@ static bool si2cReadReg(uint8_t reg, uint8_t *buf, uint32_t len)
     bool ok;
 
     si2cStart();
-    ok = si2cWriteByte((uint8_t)(GYRO_ADDR << 1));
+    ok = si2cWriteByte((uint8_t)(gyro_addr << 1));
     if (ok) {
         ok = si2cWriteByte(reg);
     }
     if (ok) {
         si2cStart(); /* repeated start */
-        ok = si2cWriteByte((uint8_t)((GYRO_ADDR << 1) | 1));
+        ok = si2cWriteByte((uint8_t)((gyro_addr << 1) | 1));
     }
     if (!ok) {
         si2cStop();
@@ -863,18 +872,19 @@ static bool si2cReadReg(uint8_t reg, uint8_t *buf, uint32_t len)
 
 static bool gyroReadData(int16_t *acc, int16_t *gyr)
 {
-    uint8_t b[14];
+    uint8_t b[12];
 
-    if (!si2cReadReg(GYRO_DATA, b, 14)) {
+    if (!si2cReadReg(GYRO_DATA_G, b, 12)) {
         return false;
     }
 
-    acc[0] = (int16_t)(((uint16_t) b[0] << 8) | b[1]);
-    acc[1] = (int16_t)(((uint16_t) b[2] << 8) | b[3]);
-    acc[2] = (int16_t)(((uint16_t) b[4] << 8) | b[5]);
-    gyr[0] = (int16_t)(((uint16_t) b[8] << 8) | b[9]);
-    gyr[1] = (int16_t)(((uint16_t) b[10] << 8) | b[11]);
-    gyr[2] = (int16_t)(((uint16_t) b[12] << 8) | b[13]);
+    /* LSM6DSR: low byte first (the MPU6050 order was the exact opposite) */
+    gyr[0] = (int16_t)(((uint16_t) b[1] << 8) | b[0]);
+    gyr[1] = (int16_t)(((uint16_t) b[3] << 8) | b[2]);
+    gyr[2] = (int16_t)(((uint16_t) b[5] << 8) | b[4]);
+    acc[0] = (int16_t)(((uint16_t) b[7] << 8) | b[6]);
+    acc[1] = (int16_t)(((uint16_t) b[9] << 8) | b[8]);
+    acc[2] = (int16_t)(((uint16_t) b[11] << 8) | b[10]);
     return true;
 }
 
@@ -889,13 +899,41 @@ static void gyroRun(void)
     lcdInit();
     lcdRect(0, 0, LCD_W - 1, LCD_H - 1, LCD_BG);
 
-    okWho = si2cReadReg(GYRO_REG_WHO, &who, 1);
+    /* Probe both LSM6DSR addresses: reset, then poll WHO_AM_I = 0x6B */
+    okWho = false;
+    {
+        const uint8_t cand[2] = {0x6B, 0x6A};
 
-    si2cWriteReg(0x6B, 0x00); /* wake up */
-    delay_cycles(DELAY_MS(50));
-    si2cWriteReg(0x1B, 0x00); /* gyro range +-250 dps */
-    si2cWriteReg(0x1C, 0x00); /* accel range +-2 g */
-    delay_cycles(DELAY_MS(20));
+        for (uint32_t a = 0; a < 2 && !okWho; a++) {
+            gyro_addr = cand[a];
+            (void) si2cWriteReg(0x01, 0x00); /* back to main register page */
+            (void) si2cWriteReg(0x12, 0x01); /* CTRL3_C: software reset */
+            delay_cycles(DELAY_MS(10));
+            for (uint32_t t = 0; t < 20 && !okWho; t++) {
+                if (si2cReadReg(GYRO_REG_WHO, &who, 1) &&
+                    who == GYRO_WHO_VALUE) {
+                    okWho = true;
+                } else {
+                    delay_cycles(DELAY_MS(10));
+                }
+            }
+        }
+    }
+
+    if (okWho) {
+        /* Init sequence (SeekFree zf_device_imu963ra, hub parts omitted) */
+        si2cWriteReg(0x0D, 0x03); /* INT1_CTRL */
+        si2cWriteReg(0x10, 0x3C); /* CTRL1_XL: accel +-8 g, ODR on */
+        si2cWriteReg(0x11, 0x5C); /* CTRL2_G: gyro +-2000 dps, ODR on */
+        si2cWriteReg(0x12, 0x44); /* CTRL3_C: BDU + register auto-increment,
+                                     required for the 12-byte burst read */
+        si2cWriteReg(0x13, 0x02); /* CTRL4_C */
+        si2cWriteReg(0x14, 0x00); /* CTRL5_C */
+        si2cWriteReg(0x15, 0x00); /* CTRL6_C */
+        si2cWriteReg(0x16, 0x00); /* CTRL7_G */
+        si2cWriteReg(0x18, 0x01); /* CTRL9_XL: I3C interface off */
+        delay_cycles(DELAY_MS(20));
+    }
 
     lcdText(0, 0, "WHO", LCD_FG, LCD_BG);
     if (okWho) {
