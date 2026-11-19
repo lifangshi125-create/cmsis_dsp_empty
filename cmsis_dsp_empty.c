@@ -375,6 +375,13 @@ static const lcd_glyph_t lcd_font[] = {
     {'H', {0x66, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00}},
     {'O', {0x3C, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x00}},
     {'R', {0x7C, 0x66, 0x66, 0x7C, 0x6C, 0x66, 0x66, 0x00}},
+    {'S', {0x3C, 0x66, 0x60, 0x3C, 0x06, 0x66, 0x3C, 0x00}},
+    {'N', {0x66, 0x76, 0x7E, 0x7E, 0x6E, 0x66, 0x66, 0x00}},
+    {'U', {0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x00}},
+    {'L', {0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x7E, 0x00}},
+    {'.', {0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00}},
+    {'P', {0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00}},
+    {'T', {0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00}},
     {'W', {0x63, 0x63, 0x63, 0x6B, 0x7F, 0x77, 0x63, 0x00}},
     {'X', {0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00}},
     {'Y', {0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x18, 0x00}},
@@ -460,6 +467,44 @@ static void lcdHex(uint16_t x, uint16_t y, uint32_t v, uint8_t digits,
 
         lcdChar(x, y, (nib < 10) ? (char)('0' + nib) : (char)('A' + nib - 10),
             fg, bg);
+        x = (uint16_t)(x + 8);
+    }
+}
+
+/* Value in units of 10^-decimals, printed right aligned in a fixed field */
+static void lcdFixed(uint16_t x, uint16_t y, int32_t v, uint32_t decimals,
+    uint16_t width, uint16_t fg, uint16_t bg)
+{
+    char     buf[12];
+    int32_t  n   = 0;
+    bool     neg = (v < 0);
+    uint32_t i;
+
+    if (neg) {
+        v = -v;
+    }
+    for (i = 0; i < decimals; i++) {
+        buf[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    buf[n++] = '.';
+    if (v == 0) {
+        buf[n++] = '0';
+    }
+    while (v > 0 && n < 10) {
+        buf[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    if (neg) {
+        buf[n++] = '-';
+    }
+
+    for (i = (uint32_t) n; i < width; i++) {
+        lcdChar(x, y, ' ', fg, bg);
+        x = (uint16_t)(x + 8);
+    }
+    while (n > 0) {
+        lcdChar(x, y, buf[--n], fg, bg);
         x = (uint16_t)(x + 8);
     }
 }
@@ -641,10 +686,12 @@ static bool imuRead(uint8_t addr, uint8_t reg, uint8_t *buf, uint32_t len)
 
 static void imuTest(void)
 {
-    uint8_t  id     = 0;
-    bool     found6 = imuPing(IMU_ADDR_6AXIS);
-    bool     foundM = imuPing(IMU_ADDR_MAG);
-    uint16_t colour;
+    uint8_t  id75 = 0, id72 = 0, id6b = 0, id6a = 0;
+    bool     r75 = false, r72 = false, r6b = false, r6a = false;
+    bool     found6  = imuPing(IMU_ADDR_6AXIS);
+    bool     foundM  = imuPing(IMU_ADDR_MAG);
+    bool     found6b = imuPing(0x6B);
+    bool     found6a = imuPing(0x6A);
 
     dbgStr("\r\nI2C scan: 0x68 ");
     dbgStr(found6 ? "ACK" : "---");
@@ -652,29 +699,62 @@ static void imuTest(void)
     dbgStr(foundM ? "ACK" : "---");
     dbgStr("\r\n");
 
-    if (found6 && imuRead(IMU_ADDR_6AXIS, 0x75, &id, 1)) {
-        dbgStr("WHO_AM_I(0x75) = ");
-        dbgHex(id);
-        dbgStr("\r\n");
+    if (found6) {
+        r75 = imuRead(IMU_ADDR_6AXIS, 0x75, &id75, 1);
+        r72 = imuRead(IMU_ADDR_6AXIS, 0x72, &id72, 1);
     }
-    if (found6 && imuRead(IMU_ADDR_6AXIS, 0x72, &id, 1)) {
-        dbgStr("WHO_AM_I(0x72) = ");
-        dbgHex(id);
-        dbgStr("\r\n");
+    if (found6b) {
+        r6b = imuRead(0x6B, 0x0F, &id6b, 1);
+    }
+    if (found6a) {
+        r6a = imuRead(0x6A, 0x0F, &id6a, 1);
     }
 
-    if (found6 && foundM) {
-        colour = LCD_RGB565(0, 255, 0); /* green: both devices answered */
-    } else if (found6) {
-        colour = LCD_RGB565(255, 255, 0); /* yellow: only the six-axis part */
-    } else if (foundM) {
-        colour = LCD_RGB565(0, 0, 255); /* blue: only the magnetometer */
+    /* DIAG: show the scan on the LCD so a photo of the screen is enough.
+     * 68 / 2C = the addresses the old code used, 6B / 6A = LSM6DSR.
+     * 75 / 72 = WHO registers on the 0x68 chip, 0F = WHO on 6B / 6A. */
+    lcdInit();
+    lcdRect(0, 0, LCD_W - 1, LCD_H - 1, LCD_RGB565(0, 0, 0));
+    lcdText(0, 0, "SCAN", LCD_RGB565(255, 255, 255), LCD_RGB565(0, 0, 0));
+
+    lcdText(0, 16, "68", LCD_RGB565(255, 255, 255), LCD_RGB565(0, 0, 0));
+    lcdText(32, 16, found6 ? "ACK" : "---",
+        LCD_RGB565(255, 255, 255), LCD_RGB565(0, 0, 0));
+    lcdText(0, 32, "2C", LCD_RGB565(255, 255, 255), LCD_RGB565(0, 0, 0));
+    lcdText(32, 32, foundM ? "ACK" : "---",
+        LCD_RGB565(255, 255, 255), LCD_RGB565(0, 0, 0));
+
+    lcdText(0, 48, "75", LCD_RGB565(255, 255, 255), LCD_RGB565(0, 0, 0));
+    if (r75) {
+        lcdHex(32, 48, id75, 2, LCD_RGB565(255, 255, 255), LCD_RGB565(0, 0, 0));
     } else {
-        colour = LCD_RGB565(255, 0, 0); /* red: nothing answered */
+        lcdText(32, 48, "--", LCD_RGB565(255, 255, 255), LCD_RGB565(0, 0, 0));
+    }
+    lcdText(0, 64, "72", LCD_RGB565(255, 255, 255), LCD_RGB565(0, 0, 0));
+    if (r72) {
+        lcdHex(32, 64, id72, 2, LCD_RGB565(255, 255, 255), LCD_RGB565(0, 0, 0));
+    } else {
+        lcdText(32, 64, "--", LCD_RGB565(255, 255, 255), LCD_RGB565(0, 0, 0));
     }
 
-    lcdRect(32, 32, 95, 95, colour);
+    lcdText(0, 80, "6B", LCD_RGB565(255, 255, 255), LCD_RGB565(0, 0, 0));
+    lcdText(32, 80, found6b ? "ACK" : "---",
+        LCD_RGB565(255, 255, 255), LCD_RGB565(0, 0, 0));
+    if (r6b) {
+        lcdHex(80, 80, id6b, 2, LCD_RGB565(255, 255, 255), LCD_RGB565(0, 0, 0));
+    }
+    lcdText(0, 96, "6A", LCD_RGB565(255, 255, 255), LCD_RGB565(0, 0, 0));
+    lcdText(32, 96, found6a ? "ACK" : "---",
+        LCD_RGB565(255, 255, 255), LCD_RGB565(0, 0, 0));
+    if (r6a) {
+        lcdHex(80, 96, id6a, 2, LCD_RGB565(255, 255, 255), LCD_RGB565(0, 0, 0));
+    }
+
+    while (1) {
+        /* hold the result on screen */
+    }
 }
+
 #endif /* IMU_TEST */
 
 #if GYRO_TEST
@@ -729,6 +809,10 @@ static void si2cLow(GPIO_Regs *port, uint32_t pin, uint32_t iomux)
 
 static void sdaHigh(void)
 {
+    /* Output must be disabled explicitly: switching the pin back to an input
+     * does not clear the output enable, so a pin that was driven low once
+     * would stay low forever (and make every address look ACKed). */
+    DL_GPIO_disableOutput(SI2C_SDA_PORT, SI2C_SDA_PIN);
     si2cRelease(SI2C_SDA_IOMUX);
 }
 
@@ -739,6 +823,7 @@ static void sdaLow(void)
 
 static void sclHigh(void)
 {
+    DL_GPIO_disableOutput(SI2C_SCL_PORT, SI2C_SCL_PIN);
     si2cRelease(SI2C_SCL_IOMUX);
 }
 
@@ -889,24 +974,61 @@ static bool gyroReadData(int16_t *acc, int16_t *gyr)
 }
 
 /* Gyro readout: never returns */
+/* Average the gyro over about a second while the board sits still. The
+ * result is subtracted from every later sample, which removes the fixed
+ * zero-rate offset (that offset would otherwise integrate into tens of
+ * degrees per minute). */
+static void gyroCalibrate(int32_t *bias)
+{
+    int32_t sum[3] = {0, 0, 0};
+    int32_t used   = 0;
+
+    for (int32_t i = 0; i < 200; i++) {
+        int16_t acc[3];
+        int16_t gyr[3];
+
+        if (gyroReadData(acc, gyr)) {
+            sum[0] += gyr[0];
+            sum[1] += gyr[1];
+            sum[2] += gyr[2];
+            used++;
+        }
+        delay_cycles(DELAY_MS(10));
+    }
+
+    if (used == 0) {
+        used = 1;
+    }
+    for (int32_t i = 0; i < 3; i++) {
+        /* round to nearest instead of truncating */
+        int32_t s = sum[i];
+
+        bias[i] = (s >= 0) ? (s + used / 2) / used : (s - used / 2) / used;
+    }
+}
+
 static void gyroRun(void)
 {
-    int16_t acc[3] = {0, 0, 0};
-    int16_t gyr[3] = {0, 0, 0};
-    uint8_t who    = 0;
-    bool    okWho;
+    int16_t acc[3]   = {0, 0, 0};
+    int16_t gyr[3]   = {0, 0, 0};
+    int32_t accF[3]  = {0, 0, 0}; /* filtered accel, Q8.8 counts */
+    int32_t bias[3]  = {0, 0, 0};
+    int32_t yawU     = 0; /* half-millidegrees */
+    bool    accFInit = false;
+    uint8_t who      = 0;
+    bool    okWho    = false;
 
     lcdInit();
     lcdRect(0, 0, LCD_W - 1, LCD_H - 1, LCD_BG);
 
-    /* Probe both LSM6DSR addresses: reset, then poll WHO_AM_I = 0x6B */
-    okWho = false;
+    /* The bus scan found the LSM6DSR at 0x6B (SDO high). Probe 0x6B and 0x6A
+     * anyway so a module with SDO tied low works as well. */
     {
         const uint8_t cand[2] = {0x6B, 0x6A};
 
         for (uint32_t a = 0; a < 2 && !okWho; a++) {
             gyro_addr = cand[a];
-            (void) si2cWriteReg(0x01, 0x00); /* back to main register page */
+            (void) si2cWriteReg(0x01, 0x00);
             (void) si2cWriteReg(0x12, 0x01); /* CTRL3_C: software reset */
             delay_cycles(DELAY_MS(10));
             for (uint32_t t = 0; t < 20 && !okWho; t++) {
@@ -921,12 +1043,11 @@ static void gyroRun(void)
     }
 
     if (okWho) {
-        /* Init sequence (SeekFree zf_device_imu963ra, hub parts omitted) */
+        /* LSM6DSR init (values from the SeekFree driver) */
         si2cWriteReg(0x0D, 0x03); /* INT1_CTRL */
         si2cWriteReg(0x10, 0x3C); /* CTRL1_XL: accel +-8 g, ODR on */
         si2cWriteReg(0x11, 0x5C); /* CTRL2_G: gyro +-2000 dps, ODR on */
-        si2cWriteReg(0x12, 0x44); /* CTRL3_C: BDU + register auto-increment,
-                                     required for the 12-byte burst read */
+        si2cWriteReg(0x12, 0x44); /* CTRL3_C: BDU + register auto-increment */
         si2cWriteReg(0x13, 0x02); /* CTRL4_C */
         si2cWriteReg(0x14, 0x00); /* CTRL5_C */
         si2cWriteReg(0x15, 0x00); /* CTRL6_C */
@@ -942,19 +1063,80 @@ static void gyroRun(void)
         lcdText(32, 0, "--", LCD_FG, LCD_BG);
     }
 
+    if (okWho) {
+        delay_cycles(DELAY_MS(200)); /* let the gyro settle after ODR on */
+
+        lcdText(0, 64, "CAL", LCD_FG, LCD_BG); /* keep the board still */
+        gyroCalibrate(bias);
+        lcdText(0, 64, "   ", LCD_FG, LCD_BG);
+    }
+
     while (1) {
+        /* Pressing a button re-calibrates and zeroes the yaw */
+        if (startStopPressed()) {
+            yawU = 0;
+            lcdText(0, 64, "CAL", LCD_FG, LCD_BG);
+            gyroCalibrate(bias);
+            lcdText(0, 64, "   ", LCD_FG, LCD_BG);
+        }
+
         bool ok = gyroReadData(acc, gyr);
 
         if (ok) {
-            lcdText(0, 24, "GX", LCD_FG, LCD_BG);
-            lcdInt(24, 24, gyr[0], 6, LCD_FG, LCD_BG);
-            lcdText(0, 48, "GY", LCD_FG, LCD_BG);
-            lcdInt(24, 48, gyr[1], 6, LCD_FG, LCD_BG);
-            lcdText(0, 72, "GZ", LCD_FG, LCD_BG);
-            lcdInt(24, 72, gyr[2], 6, LCD_FG, LCD_BG);
+            int32_t gz = (int32_t) gyr[2] - bias[2];
+            int32_t mg[3];
+            float   axg, ayg, azg, horiz, roll, pitch;
+
+            /* Yaw integration at one sample per ~50 ms: one LSB is 70 mdps,
+             * so one sample adds 70 * 0.05 = 3.5 mdeg = 7 half-mdeg. */
+            yawU += gz * 7;
+
+            /* 8-tap exponential low pass on the accelerometer (time constant
+             * about 0.4 s). Tilt is slow, so the noise can be filtered away. */
+            if (!accFInit) {
+                accF[0]  = (int32_t) acc[0] << 8;
+                accF[1]  = (int32_t) acc[1] << 8;
+                accF[2]  = (int32_t) acc[2] << 8;
+                accFInit = true;
+            } else {
+                for (int32_t i = 0; i < 3; i++) {
+                    accF[i] += (((int32_t) acc[i] << 8) - accF[i]) >> 3;
+                }
+            }
+
+            /* Accel: 0.244 mg/LSB at +-8 g, shown in g with three decimals */
+            mg[0] = (int32_t)(accF[0] >> 8) * 244 / 1000;
+            mg[1] = (int32_t)(accF[1] >> 8) * 244 / 1000;
+            mg[2] = (int32_t)(accF[2] >> 8) * 244 / 1000;
+
+            /* Roll and pitch from the filtered gravity vector */
+            axg   = (float) accF[0] * (0.000244f / 256.0f);
+            ayg   = (float) accF[1] * (0.000244f / 256.0f);
+            azg   = (float) accF[2] * (0.000244f / 256.0f);
+            horiz = 0.0f;
+            roll  = 0.0f;
+            pitch = 0.0f;
+            (void) arm_sqrt_f32(ayg * ayg + azg * azg, &horiz);
+            (void) arm_atan2_f32(ayg, azg, &roll);
+            (void) arm_atan2_f32(-axg, horiz, &pitch);
+            roll *= 57.29578f;
+            pitch *= 57.29578f;
+
+            lcdText(0, 16, "YAW", LCD_FG, LCD_BG);
+            lcdInt(32, 16, yawU / 2000, 6, LCD_FG, LCD_BG);
+            lcdText(0, 32, "AX", LCD_FG, LCD_BG);
+            lcdFixed(24, 32, mg[0], 3, 6, LCD_FG, LCD_BG);
+            lcdText(0, 48, "AY", LCD_FG, LCD_BG);
+            lcdFixed(24, 48, mg[1], 3, 6, LCD_FG, LCD_BG);
+            lcdText(0, 64, "AZ", LCD_FG, LCD_BG);
+            lcdFixed(24, 64, mg[2], 3, 6, LCD_FG, LCD_BG);
+            lcdText(0, 80, "ROL", LCD_FG, LCD_BG);
+            lcdFixed(32, 80, (int32_t)(roll * 10.0f), 1, 6, LCD_FG, LCD_BG);
+            lcdText(0, 96, "PIT", LCD_FG, LCD_BG);
+            lcdFixed(32, 96, (int32_t)(pitch * 10.0f), 1, 6, LCD_FG, LCD_BG);
         }
 
-        lcdText(0, 104, ok ? "    " : "ERR", LCD_FG, LCD_BG);
+        lcdText(0, 112, ok ? "    " : "ERR", LCD_FG, LCD_BG);
         delay_cycles(DELAY_MS(50));
     }
 }
